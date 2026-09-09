@@ -10,6 +10,8 @@
 #include <queue>
 #include <string>
 #include <memory>
+#include <limits>
+#include <exception>
 
 namespace MNN
 {
@@ -50,6 +52,11 @@ struct MNN_InferenceEngine
     std::vector<int> output_shape;
     MNN::Tensor *input_tensor;
     MNN::Tensor *output_tensor;
+
+    std::unique_ptr<MNN::Tensor> input_host;
+    std::unique_ptr<MNN::Tensor> output_host;
+    bool cache_enabled = false;
+    bool cache_dirty = false;
 
     MNN_SharedRuntime *runtime; // Optional shared runtime
     bool owns_runtime;
@@ -122,6 +129,25 @@ static void init_schedule_config(MNN::ScheduleConfig &schedule, MNN::BackendConf
     schedule.backendConfig = &backend;
 }
 
+static bool prepare_host(std::unique_ptr<MNN::Tensor> &host, MNN::Tensor *device)
+{
+    if (!device || device->getType().code != halide_type_float || device->getType().bits != 32) return false;
+    if (!host || host->shape() != device->shape()) {
+        host = make_unique_ptr<MNN::Tensor>(device, MNN::Tensor::CAFFE);
+    }
+    return host && host->host<float>();
+}
+
+static bool session_ready(MNN_InferenceEngine *engine)
+{
+    int status = -1;
+    if (!engine->interpreter->getSessionInfo(engine->default_session, MNN::Interpreter::RESIZE_STATUS, &status) || status != 0) {
+        engine->last_error = "MNN session resize/allocation failed (status " + std::to_string(status) + "); check GPU memory limits and backend configuration";
+        return false;
+    }
+    return true;
+}
+
 static bool init_engine_tensors(MNN_InferenceEngine *engine)
 {
     if (!engine->interpreter || !engine->default_session)
@@ -129,6 +155,8 @@ static bool init_engine_tensors(MNN_InferenceEngine *engine)
         return false;
     }
 
+    // Dynamic models may need an explicit input shape before their first resize.
+    // Readiness is required at execution time, not while inspecting the graph.
     // Get input tensor
     auto input_map = engine->interpreter->getSessionInputAll(engine->default_session);
     if (input_map.empty())
@@ -160,7 +188,7 @@ static bool init_engine_tensors(MNN_InferenceEngine *engine)
 
 const char *mnnr_get_version(void)
 {
-    return MNN_VERSION;
+    return MNN::getVersion();
 }
 
 bool mnnr_is_backend_available(int32_t forward_type)
@@ -198,11 +226,15 @@ void mnnr_destroy_runtime(MNN_SharedRuntime *runtime)
 
 // ============== Inference Engine API ==============
 
-MNN_InferenceEngine *mnnr_create_engine(
-    const void *buffer,
-    size_t size,
-    const MNNR_Config *config)
+MNN_InferenceEngine *mnnr_create_engine(const void *buffer, size_t size, const MNNR_Config *config)
 {
+    return mnnr_create_engine_cached(buffer, size, config, nullptr);
+}
+
+MNN_InferenceEngine *mnnr_create_engine_cached(
+    const void *buffer, size_t size, const MNNR_Config *config, const char *cache_file)
+{
+    std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
     if (!buffer || size == 0)
     {
         return nullptr;
@@ -217,6 +249,12 @@ MNN_InferenceEngine *mnnr_create_engine(
         engine->last_error = "Failed to create interpreter from buffer";
         delete engine;
         return nullptr;
+    }
+
+    if (cache_file && cache_file[0]) {
+        engine->interpreter->setCacheFile(cache_file);
+        engine->cache_enabled = true;
+        engine->cache_dirty = true;
     }
 
     // Create default session
@@ -241,11 +279,15 @@ MNN_InferenceEngine *mnnr_create_engine(
     return engine;
 }
 
-MNN_InferenceEngine *mnnr_create_engine_with_runtime(
-    const void *buffer,
-    size_t size,
-    MNN_SharedRuntime *runtime)
+MNN_InferenceEngine *mnnr_create_engine_with_runtime(const void *buffer, size_t size, MNN_SharedRuntime *runtime)
 {
+    return mnnr_create_engine_with_runtime_cached(buffer, size, runtime, nullptr);
+}
+
+MNN_InferenceEngine *mnnr_create_engine_with_runtime_cached(
+    const void *buffer, size_t size, MNN_SharedRuntime *runtime, const char *cache_file)
+{
+    std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
     if (!buffer || size == 0 || !runtime)
     {
         return nullptr;
@@ -262,6 +304,12 @@ MNN_InferenceEngine *mnnr_create_engine_with_runtime(
         engine->last_error = "Failed to create interpreter from buffer";
         delete engine;
         return nullptr;
+    }
+
+    if (cache_file && cache_file[0]) {
+        engine->interpreter->setCacheFile(cache_file);
+        engine->cache_enabled = true;
+        engine->cache_dirty = true;
     }
 
     // Create session using shared runtime config
@@ -283,8 +331,24 @@ MNN_InferenceEngine *mnnr_create_engine_with_runtime(
     return engine;
 }
 
+MNNR_ErrorCode mnnr_save_cache(MNN_InferenceEngine *engine)
+{
+    if (!engine) return MNNR_ERROR_INVALID_PARAMETER;
+    std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
+    std::lock_guard<std::mutex> lock(engine->mutex);
+    if (!engine->cache_enabled || !engine->cache_dirty) return MNNR_SUCCESS;
+    if (engine->interpreter->updateCacheFile(engine->default_session) != MNN::NO_ERROR) {
+        engine->last_error = "Failed to save GPU kernel cache";
+        return MNNR_ERROR_RUNTIME_ERROR;
+    }
+    engine->cache_dirty = false;
+    return MNNR_SUCCESS;
+}
+
 void mnnr_destroy_engine(MNN_InferenceEngine *engine)
 {
+    if (engine) mnnr_save_cache(engine);
+    std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
     if (engine)
     {
         if (engine->default_session && engine->interpreter)
@@ -369,9 +433,12 @@ MNNR_ErrorCode mnnr_run_inference(
     }
 
     // Create host tensor and copy input data
-    auto input_host = make_unique_ptr<MNN::Tensor>(engine->input_tensor, MNN::Tensor::CAFFE);
-    std::memcpy(input_host->host<float>(), input_data, input_size * sizeof(float));
-    engine->input_tensor->copyFromHostTensor(input_host.get());
+    if (!session_ready(engine) || !prepare_host(engine->input_host, engine->input_tensor)) return MNNR_ERROR_RUNTIME_ERROR;
+    std::memcpy(engine->input_host->host<float>(), input_data, input_size * sizeof(float));
+    if (!engine->input_tensor->copyFromHostTensor(engine->input_host.get())) {
+        engine->last_error = "Input tensor upload failed";
+        return MNNR_ERROR_RUNTIME_ERROR;
+    }
 
     // Run inference
     MNN::ErrorCode code = engine->interpreter->runSession(engine->default_session);
@@ -382,9 +449,12 @@ MNNR_ErrorCode mnnr_run_inference(
     }
 
     // Copy output data
-    auto output_host = make_unique_ptr<MNN::Tensor>(engine->output_tensor, MNN::Tensor::CAFFE);
-    engine->output_tensor->copyToHostTensor(output_host.get());
-    std::memcpy(output_data, output_host->host<float>(), output_size * sizeof(float));
+    if (!prepare_host(engine->output_host, engine->output_tensor) || !engine->output_tensor->copyToHostTensor(engine->output_host.get())) {
+        engine->last_error = "Output tensor download failed";
+        return MNNR_ERROR_RUNTIME_ERROR;
+    }
+    engine->cache_dirty = engine->cache_enabled;
+    std::memcpy(output_data, engine->output_host->host<float>(), output_size * sizeof(float));
 
     return MNNR_SUCCESS;
 }
@@ -669,70 +739,85 @@ MNNR_ErrorCode mnnr_run_inference_dynamic(
     std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
     std::lock_guard<std::mutex> lock(engine->mutex);
 
-    // Build new input shape
-    std::vector<int> new_shape(input_ndims);
-    size_t total_input_size = 1;
-    for (size_t i = 0; i < input_ndims; i++)
-    {
-        new_shape[i] = static_cast<int>(input_dims[i]);
-        total_input_size *= input_dims[i];
+    *output_data = nullptr;
+    *output_size = 0;
+    *output_ndims = 0;
+    try {
+        if (input_ndims == 0 || input_ndims > 8) {
+            engine->last_error = "Dynamic input needs 1..=8 dimensions";
+            return MNNR_ERROR_INVALID_PARAMETER;
+        }
+        std::vector<int> new_shape(input_ndims);
+        size_t total_input_size = 1;
+        for (size_t i = 0; i < input_ndims; i++) {
+            if (input_dims[i] == 0 || input_dims[i] > INT32_MAX || total_input_size > INT32_MAX / sizeof(float) / input_dims[i]) {
+                engine->last_error = "Dynamic input shape exceeds native tensor limits";
+                return MNNR_ERROR_INVALID_PARAMETER;
+            }
+            new_shape[i] = static_cast<int>(input_dims[i]);
+            total_input_size *= input_dims[i];
+        }
+
+        // A repeated width reuses the existing session plan and host allocations.
+        int resize_status = -1;
+        engine->interpreter->getSessionInfo(engine->default_session, MNN::Interpreter::RESIZE_STATUS, &resize_status);
+        if (engine->input_shape != new_shape || resize_status != 0) {
+            engine->interpreter->resizeTensor(engine->input_tensor, new_shape);
+            engine->interpreter->resizeSession(engine->default_session);
+            if (!init_engine_tensors(engine)) return MNNR_ERROR_RUNTIME_ERROR;
+        }
+        if (!session_ready(engine) || !prepare_host(engine->input_host, engine->input_tensor)) {
+            engine->last_error = "Input tensor allocation/resize failed";
+            return MNNR_ERROR_RUNTIME_ERROR;
+        }
+        std::memcpy(engine->input_host->host<float>(), input_data, total_input_size * sizeof(float));
+        if (!engine->input_tensor->copyFromHostTensor(engine->input_host.get())) {
+            engine->last_error = "Dynamic input tensor upload failed";
+            return MNNR_ERROR_RUNTIME_ERROR;
+        }
+        const auto code = engine->interpreter->runSession(engine->default_session);
+        if (code != MNN::NO_ERROR) {
+            engine->last_error = "Dynamic inference failed, MNN code " + std::to_string(static_cast<int>(code));
+            return MNNR_ERROR_RUNTIME_ERROR;
+        }
+        const auto outputs = engine->interpreter->getSessionOutputAll(engine->default_session);
+        if (outputs.empty()) {
+            engine->last_error = "No output tensors found";
+            return MNNR_ERROR_RUNTIME_ERROR;
+        }
+        engine->output_tensor = outputs.begin()->second;
+        const auto shape = engine->output_tensor->shape();
+        if (shape.empty() || shape.size() > 8) {
+            engine->last_error = "Unsupported output rank";
+            return MNNR_ERROR_RUNTIME_ERROR;
+        }
+        size_t count = 1;
+        for (const auto dim : shape) {
+            if (dim <= 0 || count > INT32_MAX / sizeof(float) / static_cast<size_t>(dim)) {
+                engine->last_error = "Invalid or oversized output shape";
+                return MNNR_ERROR_RUNTIME_ERROR;
+            }
+            count *= static_cast<size_t>(dim);
+        }
+        if (!prepare_host(engine->output_host, engine->output_tensor) || !engine->output_tensor->copyToHostTensor(engine->output_host.get())) {
+            engine->last_error = "Dynamic output tensor download failed";
+            return MNNR_ERROR_RUNTIME_ERROR;
+        }
+        std::unique_ptr<float[]> result(new float[count]);
+        std::memcpy(result.get(), engine->output_host->host<float>(), count * sizeof(float));
+        for (size_t i = 0; i < shape.size(); ++i) output_dims[i] = static_cast<size_t>(shape[i]);
+        engine->output_shape = shape;
+        engine->cache_dirty = engine->cache_enabled;
+        *output_size = count;
+        *output_ndims = shape.size();
+        *output_data = result.release();
+        return MNNR_SUCCESS;
+    } catch (const std::exception &error) {
+        engine->last_error = error.what();
+    } catch (...) {
+        engine->last_error = "Unknown exception during dynamic inference";
     }
-
-    // Resize input tensor
-    engine->interpreter->resizeTensor(engine->input_tensor, new_shape);
-    engine->interpreter->resizeSession(engine->default_session);
-
-    // Get the updated input tensor after resize
-    auto input_map = engine->interpreter->getSessionInputAll(engine->default_session);
-    if (input_map.empty())
-    {
-        engine->last_error = "No input tensors found after resize";
-        return MNNR_ERROR_RUNTIME_ERROR;
-    }
-    engine->input_tensor = input_map.begin()->second;
-
-    // Create host tensor and copy input data
-    auto input_host = make_unique_ptr<MNN::Tensor>(engine->input_tensor, MNN::Tensor::CAFFE);
-    std::memcpy(input_host->host<float>(), input_data, total_input_size * sizeof(float));
-    engine->input_tensor->copyFromHostTensor(input_host.get());
-
-    // Run inference
-    MNN::ErrorCode code = engine->interpreter->runSession(engine->default_session);
-    if (code != MNN::NO_ERROR)
-    {
-        engine->last_error = "Dynamic inference failed";
-        return MNNR_ERROR_RUNTIME_ERROR;
-    }
-
-    // Get output tensor after inference
-    auto output_map = engine->interpreter->getSessionOutputAll(engine->default_session);
-    if (output_map.empty())
-    {
-        engine->last_error = "No output tensors found";
-        return MNNR_ERROR_RUNTIME_ERROR;
-    }
-    engine->output_tensor = output_map.begin()->second;
-
-    // Get output shape
-    auto output_shape = engine->output_tensor->shape();
-    *output_ndims = output_shape.size();
-    size_t total_output_size = 1;
-    for (size_t i = 0; i < output_shape.size() && i < 8; i++)
-    {
-        output_dims[i] = static_cast<size_t>(output_shape[i]);
-        total_output_size *= output_shape[i];
-    }
-    *output_size = total_output_size;
-
-    // Allocate output buffer
-    *output_data = new float[total_output_size];
-
-    // Copy output data
-    auto output_host = make_unique_ptr<MNN::Tensor>(engine->output_tensor, MNN::Tensor::CAFFE);
-    engine->output_tensor->copyToHostTensor(output_host.get());
-    std::memcpy(*output_data, output_host->host<float>(), total_output_size * sizeof(float));
-
-    return MNNR_SUCCESS;
+    return MNNR_ERROR_RUNTIME_ERROR;
 }
 
 void mnnr_free_output(float *output_data)

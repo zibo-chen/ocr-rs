@@ -72,12 +72,22 @@ extern "C"
         size_t size,
         const MNNR_Config *config);
 
+    // Load an optional GPU kernel cache before creating the first session.
+    MNN_InferenceEngine *mnnr_create_engine_cached(
+        const void *buffer, size_t size, const MNNR_Config *config, const char *cache_file);
+
+    // Save kernels/tuning results after the last successful resize/inference.
+    MNNR_ErrorCode mnnr_save_cache(MNN_InferenceEngine *engine);
+
     // Create an inference engine using a shared runtime
     // This allows multiple engines to share thread pool and memory pool
     MNN_InferenceEngine *mnnr_create_engine_with_runtime(
         const void *buffer,
         size_t size,
         MNN_SharedRuntime *runtime);
+
+    MNN_InferenceEngine *mnnr_create_engine_with_runtime_cached(
+        const void *buffer, size_t size, MNN_SharedRuntime *runtime, const char *cache_file);
 
     // Destroy an inference engine
     void mnnr_destroy_engine(MNN_InferenceEngine *engine);

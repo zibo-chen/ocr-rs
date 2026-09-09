@@ -2,6 +2,7 @@
 //!
 //! This module is used during docs.rs build, providing type definitions without actual implementations
 
+use super::GpuTuningMode;
 use ndarray::{ArrayD, ArrayViewD};
 use std::path::Path;
 
@@ -131,6 +132,8 @@ pub struct InferenceConfig {
     pub use_cache: bool,
     pub data_format: DataFormat,
     pub gpu_memory_mode: GpuMemoryMode,
+    pub gpu_tuning_mode: GpuTuningMode,
+    pub gpu_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for InferenceConfig {
@@ -139,9 +142,11 @@ impl Default for InferenceConfig {
             thread_count: 4,
             precision_mode: PrecisionMode::Normal,
             backend: Backend::CPU,
-            use_cache: true,
+            use_cache: false,
             data_format: DataFormat::NCHW,
             gpu_memory_mode: GpuMemoryMode::Auto,
+            gpu_tuning_mode: GpuTuningMode::Auto,
+            gpu_cache_dir: None,
         }
     }
 }
@@ -176,6 +181,17 @@ impl InferenceConfig {
         self
     }
 
+    /// Set GPU kernel tuning effort.
+    pub fn with_gpu_tuning(mut self, mode: GpuTuningMode) -> Self {
+        self.gpu_tuning_mode = mode;
+        self
+    }
+    /// Enable persistent GPU caches.
+    pub fn with_gpu_cache_dir(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
+        self.gpu_cache_dir = Some(directory.into());
+        self.use_cache = true;
+        self
+    }
     /// Set the data format
     pub fn with_data_format(mut self, format: DataFormat) -> Self {
         self.data_format = format;
@@ -208,6 +224,10 @@ pub struct InferenceEngine {
 }
 
 impl InferenceEngine {
+    /// Save GPU kernel caches (unavailable in documentation builds).
+    pub fn save_cache(&self) -> Result<()> {
+        Err(MnnError::Unsupported)
+    }
     /// Create inference engine from file
     pub fn from_file(
         _model_path: impl AsRef<Path>,
@@ -233,6 +253,12 @@ impl InferenceEngine {
         unimplemented!(
             "This feature is only available at runtime, not available during documentation build"
         )
+    }
+
+    /// Check if model has dynamic shape (contains -1 dimension).
+    pub fn has_dynamic_shape(&self) -> bool {
+        self._input_shape.iter().any(|&d| d > 100000)
+            || self._output_shape.iter().any(|&d| d > 100000)
     }
 
     /// Get input shape

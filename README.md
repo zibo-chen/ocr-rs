@@ -173,3 +173,11 @@ This feature controls the runtime linked by `ocr-rs`; a user-supplied DLL select
 ## License
 
 Apache-2.0
+
+### GPU cold-start and wide-image troubleshooting
+
+OpenCL OCR defaults to Buffer memory and fast tuning. Vulkan OCR defaults to no
+tuning and High precision when `OcrEngineConfig` uses Normal precision. Use
+`with_gpu_tuning` to choose another tuning tradeoff and `with_gpu_cache_dir` to
+persist model-specific kernels. See [issue #49 validation and cache guidance](docs/issue-49-gpu.md)
+for CPU/GPU text comparisons, cold/warm benchmarks and driver-specific testing.

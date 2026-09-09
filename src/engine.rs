@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::det::{DetModel, DetOptions};
 use crate::error::{OcrError, OcrResult};
-use crate::mnn::{Backend, GpuMemoryMode, InferenceConfig, PrecisionMode};
+use crate::mnn::{Backend, GpuMemoryMode, GpuTuningMode, InferenceConfig, PrecisionMode};
 use crate::ori::{OriModel, OriOptions};
 use crate::postprocess::{compute_iou, TextBox};
 use crate::rec::{
@@ -164,6 +164,10 @@ pub struct OcrEngineConfig {
     pub backend: Backend,
     /// OpenCL tensor memory representation
     pub gpu_memory_mode: GpuMemoryMode,
+    /// Kernel tuning effort. Auto selects fast OpenCL tuning and no Vulkan tuning.
+    pub gpu_tuning_mode: GpuTuningMode,
+    /// Optional persistent GPU cache directory; files are isolated by model/configuration.
+    pub gpu_cache_dir: Option<std::path::PathBuf>,
     /// Thread count
     pub thread_count: i32,
     /// Precision mode
@@ -187,6 +191,8 @@ impl Default for OcrEngineConfig {
         Self {
             backend: Backend::CPU,
             gpu_memory_mode: GpuMemoryMode::Buffer,
+            gpu_tuning_mode: GpuTuningMode::Auto,
+            gpu_cache_dir: None,
             thread_count: 4,
             precision_mode: PrecisionMode::Normal,
             det_options: DetOptions::default(),
@@ -214,6 +220,18 @@ impl OcrEngineConfig {
     /// Set the OpenCL tensor memory representation.
     pub fn with_gpu_memory_mode(mut self, mode: GpuMemoryMode) -> Self {
         self.gpu_memory_mode = mode;
+        self
+    }
+
+    /// Set kernel tuning effort for GPU backends.
+    pub fn with_gpu_tuning(mut self, mode: GpuTuningMode) -> Self {
+        self.gpu_tuning_mode = mode;
+        self
+    }
+
+    /// Persist GPU kernels/tuning results across engine lifetimes.
+    pub fn with_gpu_cache_dir(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
+        self.gpu_cache_dir = Some(directory.into());
         self
     }
 
@@ -301,9 +319,20 @@ impl OcrEngineConfig {
     fn to_inference_config(&self) -> InferenceConfig {
         InferenceConfig {
             thread_count: self.thread_count,
-            precision_mode: self.precision_mode,
+            // Normal OCR mode prioritizes numerical stability on Vulkan, whose
+            // native Normal mode may enable fp16 storage/arithmetic.
+            precision_mode: if self.backend == Backend::Vulkan
+                && self.precision_mode == PrecisionMode::Normal
+            {
+                PrecisionMode::High
+            } else {
+                self.precision_mode
+            },
             backend: self.backend,
             gpu_memory_mode: self.gpu_memory_mode,
+            gpu_tuning_mode: self.gpu_tuning_mode,
+            gpu_cache_dir: self.gpu_cache_dir.clone(),
+            use_cache: self.gpu_cache_dir.is_some(),
             ..Default::default()
         }
     }
@@ -1411,6 +1440,30 @@ mod tests {
         assert_eq!(
             config.to_inference_config().gpu_memory_mode,
             GpuMemoryMode::Buffer
+        );
+    }
+
+    #[test]
+    fn vulkan_ocr_defaults_to_high_precision_without_overriding_explicit_low() {
+        let config = OcrEngineConfig::new().with_backend(Backend::Vulkan);
+        assert_eq!(
+            config.to_inference_config().precision_mode,
+            PrecisionMode::High
+        );
+        assert_eq!(
+            config.to_inference_config().gpu_tuning_mode,
+            GpuTuningMode::Auto
+        );
+        assert_eq!(
+            config
+                .with_precision(PrecisionMode::Low)
+                .to_inference_config()
+                .precision_mode,
+            PrecisionMode::Low
+        );
+        assert_eq!(
+            OcrEngineConfig::new().to_inference_config().precision_mode,
+            PrecisionMode::Normal
         );
     }
 

@@ -2,6 +2,9 @@
 //!
 //! This module encapsulates the low-level interfaces of the MNN C++ inference framework, providing safe Rust APIs.
 
+mod gpu;
+pub use gpu::GpuTuningMode;
+
 // Use stub implementation when building on docs.rs
 #[cfg(feature = "docsrs")]
 mod docsrs_stub;
@@ -13,9 +16,12 @@ pub use docsrs_stub::*;
 #[cfg(not(feature = "docsrs"))]
 mod normal_impl {
 
+    use super::GpuTuningMode;
     use ndarray::{ArrayD, ArrayViewD, IxDyn};
+    use sha2::{Digest, Sha256};
     use std::ffi::CStr;
     use std::ptr::NonNull;
+    use std::{ffi::CString, path::PathBuf};
 
     #[allow(non_camel_case_types)]
     #[allow(non_upper_case_globals)]
@@ -191,6 +197,11 @@ mod normal_impl {
         pub backend: Backend,
         /// OpenCL tensor memory representation; ignored by other backends
         pub gpu_memory_mode: GpuMemoryMode,
+        /// GPU tuning effort. Auto avoids the wide search on each OCR input width.
+        pub gpu_tuning_mode: GpuTuningMode,
+        /// Optional directory for model/config-specific GPU kernel caches.
+        /// Caches are written when the engine is dropped or `save_cache` is called.
+        pub gpu_cache_dir: Option<PathBuf>,
     }
 
     impl Default for InferenceConfig {
@@ -202,6 +213,8 @@ mod normal_impl {
                 data_format: DataFormat::NCHW,
                 backend: Backend::CPU,
                 gpu_memory_mode: GpuMemoryMode::Auto,
+                gpu_tuning_mode: GpuTuningMode::Auto,
+                gpu_cache_dir: None,
             }
         }
     }
@@ -236,6 +249,60 @@ mod normal_impl {
             self
         }
 
+        /// Set GPU kernel tuning effort.
+        pub fn with_gpu_tuning(mut self, mode: GpuTuningMode) -> Self {
+            self.gpu_tuning_mode = mode;
+            self
+        }
+
+        /// Enable a persistent GPU kernel cache, isolated by model and configuration.
+        pub fn with_gpu_cache_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+            self.gpu_cache_dir = Some(directory.into());
+            self.use_cache = true;
+            self
+        }
+
+        fn validate(&self) -> Result<()> {
+            if self.backend == Backend::Vulkan && self.gpu_tuning_mode.bits(true).is_none() {
+                return Err(MnnError::InvalidParameter(
+                    "Fast/Normal tuning are OpenCL-only; use Auto/None/Wide/Heavy for Vulkan"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn cache_path(&self, model: &[u8]) -> Result<Option<CString>> {
+            let Some(directory) = self.gpu_cache_dir.as_ref().filter(|_| {
+                matches!(
+                    self.backend,
+                    Backend::OpenCL | Backend::Vulkan | Backend::Metal
+                )
+            }) else {
+                return Ok(None);
+            };
+            std::fs::create_dir_all(directory).map_err(|e| {
+                MnnError::InvalidParameter(format!("cannot create GPU cache directory: {e}"))
+            })?;
+            let mut hash = Sha256::new();
+            hash.update(model);
+            hash.update(super::get_version().as_bytes());
+            hash.update(
+                format!(
+                    "{:?}:{:?}:{:?}:{:?}",
+                    self.backend, self.precision_mode, self.gpu_tuning_mode, self.gpu_memory_mode
+                )
+                .as_bytes(),
+            );
+            let path = directory.join(format!("{:x}.mnn-cache", hash.finalize()));
+            let path = path.to_str().ok_or_else(|| {
+                MnnError::InvalidParameter("GPU cache path must be UTF-8".to_owned())
+            })?;
+            CString::new(path)
+                .map(Some)
+                .map_err(|_| MnnError::InvalidParameter("GPU cache path contains NUL".to_owned()))
+        }
+
         /// Set data format
         pub fn with_data_format(mut self, format: DataFormat) -> Self {
             self.data_format = format;
@@ -250,12 +317,33 @@ mod normal_impl {
                 data_format: self.data_format as i32,
                 forward_type: self.backend.to_forward_type(),
                 gpu_mode: match self.backend {
-                    Backend::OpenCL => (1 << 2) | self.gpu_memory_mode as i32,
-                    Backend::Vulkan => 1 << 2,
+                    Backend::OpenCL => {
+                        self.gpu_tuning_mode.bits(false).unwrap_or(1) | self.gpu_memory_mode as i32
+                    }
+                    Backend::Vulkan => self.gpu_tuning_mode.bits(true).unwrap_or(1),
                     _ => 0,
                 },
             }
         }
+    }
+
+    fn validate_dynamic_input(length: usize, shape: &[usize]) -> Result<()> {
+        if shape.is_empty()
+            || shape.len() > 8
+            || shape.iter().any(|&d| d == 0 || d > i32::MAX as usize)
+        {
+            return Err(MnnError::InvalidParameter(
+                "dynamic input needs 1..=8 positive i32 dimensions".to_owned(),
+            ));
+        }
+        let elements = shape.iter().try_fold(1_usize, |n, &d| n.checked_mul(d));
+        if elements != Some(length) || length > i32::MAX as usize / std::mem::size_of::<f32>() {
+            return Err(MnnError::InvalidParameter(
+                "dynamic input shape does not match buffer length or exceeds native limits"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     // ============== Shared Runtime ==============
@@ -263,11 +351,13 @@ mod normal_impl {
     /// Shared runtime for sharing resources among multiple engines
     pub struct SharedRuntime {
         ptr: NonNull<ffi::MNN_SharedRuntime>,
+        config: InferenceConfig,
     }
 
     impl SharedRuntime {
         /// Create new shared runtime
         pub fn new(config: &InferenceConfig) -> Result<Self> {
+            config.validate()?;
             config.backend.ensure_available()?;
             let c_config = config.to_ffi();
             let runtime_ptr = unsafe { ffi::mnnr_create_runtime(&c_config) };
@@ -276,7 +366,10 @@ mod normal_impl {
                 MnnError::RuntimeError("Create shared runtime failed".to_string())
             })?;
 
-            Ok(SharedRuntime { ptr })
+            Ok(SharedRuntime {
+                ptr,
+                config: config.clone(),
+            })
         }
 
         pub(crate) fn as_ptr(&self) -> *mut ffi::MNN_SharedRuntime {
@@ -342,27 +435,46 @@ mod normal_impl {
             }
 
             let cfg = config.unwrap_or_default();
+            cfg.validate()?;
             cfg.backend.ensure_available()?;
             let c_config = cfg.to_ffi();
+            let cache_path = cfg.cache_path(model_buffer)?;
 
             let engine_ptr = unsafe {
-                ffi::mnnr_create_engine(
+                ffi::mnnr_create_engine_cached(
                     model_buffer.as_ptr() as *const _,
                     model_buffer.len(),
                     &c_config,
+                    cache_path.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
                 )
             };
 
             let ptr = NonNull::new(engine_ptr)
                 .ok_or_else(|| MnnError::ModelLoadFailed(get_last_error_message(None)))?;
 
-            let (input_shape, output_shape) = unsafe { Self::get_shapes(ptr.as_ptr())? };
+            let (input_shape, output_shape) = unsafe { Self::get_shapes(ptr.as_ptr()) }
+                .inspect_err(|_| {
+                    unsafe { ffi::mnnr_destroy_engine(ptr.as_ptr()) };
+                })?;
 
             Ok(InferenceEngine {
                 ptr,
                 input_shape,
                 output_shape,
             })
+        }
+
+        /// Save any compiled GPU kernels/tuning results to the configured cache.
+        /// Engine destruction also saves the cache on a best-effort basis.
+        pub fn save_cache(&self) -> Result<()> {
+            let status = unsafe { ffi::mnnr_save_cache(self.ptr.as_ptr()) };
+            if status == ffi::MNNR_ErrorCode_MNNR_SUCCESS {
+                Ok(())
+            } else {
+                Err(MnnError::RuntimeError(get_last_error_message(Some(
+                    self.ptr.as_ptr(),
+                ))))
+            }
         }
 
         /// Create inference engine from model file
@@ -387,18 +499,23 @@ mod normal_impl {
                 ));
             }
 
+            let cache_path = runtime.config.cache_path(model_buffer)?;
             let engine_ptr = unsafe {
-                ffi::mnnr_create_engine_with_runtime(
+                ffi::mnnr_create_engine_with_runtime_cached(
                     model_buffer.as_ptr() as *const _,
                     model_buffer.len(),
                     runtime.as_ptr(),
+                    cache_path.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
                 )
             };
 
             let ptr = NonNull::new(engine_ptr)
                 .ok_or_else(|| MnnError::ModelLoadFailed(get_last_error_message(None)))?;
 
-            let (input_shape, output_shape) = unsafe { Self::get_shapes(ptr.as_ptr())? };
+            let (input_shape, output_shape) = unsafe { Self::get_shapes(ptr.as_ptr()) }
+                .inspect_err(|_| {
+                    unsafe { ffi::mnnr_destroy_engine(ptr.as_ptr()) };
+                })?;
 
             Ok(InferenceEngine {
                 ptr,
@@ -565,6 +682,7 @@ mod normal_impl {
                 MnnError::InvalidParameter("Input data must be contiguous".to_string())
             })?;
 
+            validate_dynamic_input(input_slice.len(), &input_shape)?;
             let mut output_data: *mut f32 = std::ptr::null_mut();
             let mut output_size: usize = 0;
             let mut output_dims = [0usize; 8];
@@ -618,6 +736,7 @@ mod normal_impl {
             input: &[f32],
             input_shape: &[usize],
         ) -> Result<(Vec<f32>, Vec<usize>)> {
+            validate_dynamic_input(input.len(), input_shape)?;
             let mut output_data: *mut f32 = std::ptr::null_mut();
             let mut output_size: usize = 0;
             let mut output_dims = [0usize; 8];
@@ -700,6 +819,7 @@ mod normal_impl {
             }
 
             let cfg = config.unwrap_or_default();
+            cfg.validate()?;
             cfg.backend.ensure_available()?;
             let c_config = cfg.to_ffi();
 
@@ -821,13 +941,65 @@ mod normal_impl {
                 .with_backend(Backend::OpenCL)
                 .with_gpu_memory_mode(GpuMemoryMode::Buffer)
                 .to_ffi();
-            assert_eq!(opencl.gpu_mode, 68);
+            assert_eq!(opencl.gpu_mode, 80);
 
             let vulkan = InferenceConfig::new()
                 .with_backend(Backend::Vulkan)
                 .with_gpu_memory_mode(GpuMemoryMode::Buffer)
                 .to_ffi();
-            assert_eq!(vulkan.gpu_mode, 4);
+            assert_eq!(vulkan.gpu_mode, 1);
+        }
+
+        #[test]
+        fn tuning_overrides_and_dynamic_lengths_are_validated() {
+            let config = InferenceConfig::new()
+                .with_backend(Backend::OpenCL)
+                .with_gpu_tuning(GpuTuningMode::None);
+            assert_eq!(config.to_ffi().gpu_mode, 1);
+            let config = InferenceConfig::new()
+                .with_backend(Backend::Vulkan)
+                .with_gpu_tuning(GpuTuningMode::Fast);
+            assert!(config.validate().is_err());
+            assert!(validate_dynamic_input(6, &[1, 3, 1, 2]).is_ok());
+            for (length, shape) in [
+                (5, vec![1, 3, 1, 2]),
+                (0, vec![1, 0]),
+                (0, vec![]),
+                (1, vec![usize::MAX, 2]),
+            ] {
+                assert!(validate_dynamic_input(length, &shape).is_err());
+            }
+        }
+
+        #[test]
+        fn kernel_caches_are_isolated_by_model_and_configuration() {
+            let directory =
+                std::env::temp_dir().join(format!("ocr-cache-test-{}", std::process::id()));
+            let config = InferenceConfig::new()
+                .with_backend(Backend::OpenCL)
+                .with_gpu_cache_dir(&directory);
+            let first = config.cache_path(b"first model").unwrap().unwrap();
+            assert_eq!(first, config.cache_path(b"first model").unwrap().unwrap());
+            assert_ne!(first, config.cache_path(b"other model").unwrap().unwrap());
+            assert_ne!(
+                first,
+                config
+                    .clone()
+                    .with_gpu_tuning(GpuTuningMode::Wide)
+                    .cache_path(b"first model")
+                    .unwrap()
+                    .unwrap()
+            );
+            assert_ne!(
+                first,
+                config
+                    .clone()
+                    .with_precision(PrecisionMode::High)
+                    .cache_path(b"first model")
+                    .unwrap()
+                    .unwrap()
+            );
+            std::fs::remove_dir(directory).unwrap();
         }
 
         #[test]
