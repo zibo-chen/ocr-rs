@@ -1,6 +1,6 @@
 # GPU OCR: cold starts, wide tensors and numerical validation
 
-Issue: https://github.com/zibo-chen/rust-paddle-ocr/issues/49
+Issue: https://github.com/zibo-chen/ocr-rs/issues/49
 
 The existing OpenCL Buffer default fixes GPU image-width allocation failures.
 The follow-up reported a very slow first OpenCL inference and incorrect Vulkan
