@@ -1,6 +1,6 @@
 //! Native dynamic-shape regressions and optional device validation for issue #49.
 #![cfg(not(feature = "docsrs"))]
-use ocr_rs::mnn::SharedRuntime;
+use ocr_rs::mnn::{SessionPool, SharedRuntime};
 use ocr_rs::{Backend, GpuTuningMode, InferenceConfig, InferenceEngine, PrecisionMode};
 
 const MODEL: &[u8] = include_bytes!("../src/mnn/fixtures/layout_identity.mnn");
@@ -26,6 +26,9 @@ fn check_dynamic(engine: &InferenceEngine) {
 fn dynamic_layout_resize_and_buffer_lengths() {
     let engine = InferenceEngine::from_buffer(MODEL, None).unwrap();
     check_dynamic(&engine);
+    assert!(SessionPool::new(&engine, 0, None).is_err());
+    let pool = SessionPool::new(&engine, 2, None).unwrap();
+    assert_eq!(pool.available(), 2);
     let runtime = SharedRuntime::new(&InferenceConfig::new()).unwrap();
     let engine = InferenceEngine::from_buffer_with_runtime(MODEL, &runtime).unwrap();
     check_dynamic(&engine);

@@ -1,304 +1,46 @@
 #[path = "../build_support.rs"]
 mod build_support;
 
-use build_support::{
-    cpp_runtime_libraries, cuda_side_library_plan, prebuilt_asset_name, select_link_mode,
-    should_link_mnn_whole_archive, uses_msvc_flags, BuildConfigError, BuildFeatures,
-    CudaSideLibraryPlan, MnnLinkMode, NativeLibrary, NativeLinkKind, TargetInfo,
-};
-
-fn target<'a>(os: &'a str, arch: &'a str, env: &'a str, triple: &'a str) -> TargetInfo<'a> {
-    TargetInfo {
-        os,
-        arch,
-        env,
-        triple,
-    }
-}
+use build_support::{requires_external_installation, validate_link_features, BuildConfigError};
 
 #[test]
-fn cpu_only_linux_uses_the_prebuilt_library() {
-    let target = target("linux", "x86_64", "gnu", "x86_64-unknown-linux-gnu");
-
+fn legacy_link_features_remain_mutually_exclusive() {
     assert_eq!(
-        select_link_mode(&target, &BuildFeatures::default()),
-        Ok(MnnLinkMode::Prebuilt)
-    );
-    assert_eq!(
-        prebuilt_asset_name(&target, "dev").as_deref(),
-        Some("mnn-dev-linux-x86_64")
-    );
-}
-
-#[test]
-fn cuda_and_vulkan_force_a_source_build_when_prebuilt_has_no_gpu_backend() {
-    let target = target("linux", "x86_64", "gnu", "x86_64-unknown-linux-gnu");
-
-    for features in [
-        BuildFeatures {
-            cuda: true,
-            ..BuildFeatures::default()
-        },
-        BuildFeatures {
-            vulkan: true,
-            ..BuildFeatures::default()
-        },
-    ] {
-        assert_eq!(
-            select_link_mode(&target, &features),
-            Ok(MnnLinkMode::BuildFromSource)
-        );
-    }
-}
-
-#[test]
-fn apple_metal_uses_the_metal_enabled_prebuilt() {
-    let target = target("macos", "aarch64", "", "aarch64-apple-darwin");
-    let features = BuildFeatures {
-        metal: true,
-        ..BuildFeatures::default()
-    };
-
-    assert_eq!(
-        select_link_mode(&target, &features),
-        Ok(MnnLinkMode::Prebuilt)
-    );
-}
-
-#[test]
-fn non_metal_apple_gpu_backend_forces_a_source_build() {
-    let target = target("macos", "aarch64", "", "aarch64-apple-darwin");
-    let features = BuildFeatures {
-        opencl: true,
-        ..BuildFeatures::default()
-    };
-
-    assert_eq!(
-        select_link_mode(&target, &features),
-        Ok(MnnLinkMode::BuildFromSource)
-    );
-}
-
-#[test]
-fn windows_msvc_keeps_using_the_msvc_prebuilt() {
-    let target = target("windows", "x86_64", "msvc", "x86_64-pc-windows-msvc");
-
-    assert_eq!(
-        select_link_mode(&target, &BuildFeatures::default()),
-        Ok(MnnLinkMode::Prebuilt)
-    );
-    assert!(uses_msvc_flags(&target).unwrap());
-}
-
-#[test]
-fn windows_gnu_never_uses_the_msvc_prebuilt_or_msvc_flags() {
-    let target = target("windows", "x86_64", "gnu", "x86_64-pc-windows-gnu");
-
-    assert_eq!(prebuilt_asset_name(&target, "dev"), None);
-    assert_eq!(
-        select_link_mode(&target, &BuildFeatures::default()),
-        Ok(MnnLinkMode::BuildFromSource)
-    );
-    assert!(!uses_msvc_flags(&target).unwrap());
-}
-
-#[test]
-fn windows_gnu_cuda_source_build_is_rejected_before_invoking_cmake() {
-    let target = target("windows", "x86_64", "gnu", "x86_64-pc-windows-gnu");
-    let features = BuildFeatures {
-        cuda: true,
-        ..BuildFeatures::default()
-    };
-
-    assert_eq!(
-        select_link_mode(&target, &features),
-        Err(BuildConfigError::UnsupportedBackendForTarget {
-            backend: "cuda",
-            target: "x86_64-pc-windows-gnu",
-        })
-    );
-}
-
-#[test]
-fn user_provided_mnn_library_takes_precedence_over_backend_building() {
-    let target = target("windows", "x86_64", "gnu", "x86_64-pc-windows-gnu");
-    let features = BuildFeatures {
-        cuda: true,
-        mnn_dynamic: true,
-        ..BuildFeatures::default()
-    };
-
-    assert_eq!(
-        select_link_mode(&target, &features),
-        Ok(MnnLinkMode::Dynamic)
-    );
-}
-
-#[test]
-fn mutually_exclusive_link_features_are_rejected() {
-    let target = target("linux", "x86_64", "gnu", "x86_64-unknown-linux-gnu");
-    let features = BuildFeatures {
-        mnn_dynamic: true,
-        mnn_static: true,
-        ..BuildFeatures::default()
-    };
-
-    assert_eq!(
-        select_link_mode(&target, &features),
+        validate_link_features(true, true),
         Err(BuildConfigError::ConflictingLinkModes)
     );
+    assert_eq!(validate_link_features(true, false), Ok(()));
+    assert_eq!(validate_link_features(false, true), Ok(()));
+    assert_eq!(validate_link_features(false, false), Ok(()));
 }
 
 #[test]
-fn unknown_windows_environment_is_rejected() {
-    let target = target("windows", "x86_64", "", "x86_64-pc-windows-unknown");
-
-    assert_eq!(
-        select_link_mode(&target, &BuildFeatures::default()),
-        Err(BuildConfigError::UnsupportedWindowsEnvironment(""))
-    );
-    assert_eq!(
-        uses_msvc_flags(&target),
-        Err(BuildConfigError::UnsupportedWindowsEnvironment(""))
-    );
+fn legacy_explicit_link_modes_still_require_an_external_installation() {
+    assert!(requires_external_installation(true, false));
+    assert!(requires_external_installation(false, true));
+    assert!(!requires_external_installation(false, false));
 }
 
 #[test]
-fn ios_simulator_uses_the_simulator_asset() {
-    let target = target("ios", "aarch64", "", "aarch64-apple-ios-sim");
-
-    assert_eq!(
-        prebuilt_asset_name(&target, "dev").as_deref(),
-        Some("mnn-dev-ios-arm64-sim")
-    );
-}
-
-#[test]
-fn source_built_or_user_supplied_static_gpu_mnn_is_linked_whole_archive() {
-    let vulkan = BuildFeatures {
-        vulkan: true,
-        ..BuildFeatures::default()
-    };
-    let cuda_static = BuildFeatures {
-        cuda: true,
-        mnn_static: true,
-        ..BuildFeatures::default()
-    };
-
-    assert!(should_link_mnn_whole_archive(
-        MnnLinkMode::BuildFromSource,
-        &vulkan
-    ));
-    assert!(should_link_mnn_whole_archive(
-        MnnLinkMode::Static,
-        &cuda_static
-    ));
-}
-
-#[test]
-fn prebuilt_and_dynamic_mnn_do_not_force_whole_archive_linking() {
-    let metal = BuildFeatures {
-        metal: true,
-        ..BuildFeatures::default()
-    };
-
-    assert!(!should_link_mnn_whole_archive(
-        MnnLinkMode::Prebuilt,
-        &metal
-    ));
-    assert!(!should_link_mnn_whole_archive(MnnLinkMode::Dynamic, &metal));
-}
-
-#[test]
-fn linux_source_cuda_installs_and_links_the_mnn_cuda_side_library() {
-    assert_eq!(
-        cuda_side_library_plan("linux", true, MnnLinkMode::BuildFromSource),
-        Some(CudaSideLibraryPlan {
-            link_name: "MNN_Cuda_Main",
-            build_relative_path: Some("build/source/backend/cuda/libMNN_Cuda_Main.so"),
-            install_relative_path: Some("lib/libMNN_Cuda_Main.so"),
-        })
-    );
-}
-
-#[test]
-fn user_supplied_linux_cuda_library_is_linked_without_source_copying() {
-    assert_eq!(
-        cuda_side_library_plan("linux", true, MnnLinkMode::Static),
-        Some(CudaSideLibraryPlan {
-            link_name: "MNN_Cuda_Main",
-            build_relative_path: None,
-            install_relative_path: None,
-        })
-    );
-}
-
-#[test]
-fn cpu_only_and_windows_cuda_do_not_use_the_linux_cuda_side_library() {
-    assert_eq!(
-        cuda_side_library_plan("linux", false, MnnLinkMode::BuildFromSource),
-        None
-    );
-    assert_eq!(
-        cuda_side_library_plan("windows", true, MnnLinkMode::BuildFromSource),
-        None
-    );
-}
-
-#[test]
-fn windows_gnu_explicitly_links_libstdcxx() {
-    let target = target("windows", "x86_64", "gnu", "x86_64-pc-windows-gnu");
-
-    assert_eq!(
-        cpp_runtime_libraries(&target, false),
-        &[NativeLibrary {
-            name: "stdc++",
-            kind: NativeLinkKind::Dynamic,
-        }]
-    );
-}
-
-#[test]
-fn windows_gnu_can_statically_link_all_mingw_runtime_libraries() {
-    let target = target("windows", "x86_64", "gnu", "x86_64-pc-windows-gnu");
-
-    assert_eq!(
-        cpp_runtime_libraries(&target, true),
-        &[
-            NativeLibrary {
-                name: "stdc++",
-                kind: NativeLinkKind::Static,
-            },
-            NativeLibrary {
-                name: "gcc_eh",
-                kind: NativeLinkKind::Static,
-            },
-            NativeLibrary {
-                name: "gcc",
-                kind: NativeLinkKind::Static,
-            },
-            NativeLibrary {
-                name: "winpthread",
-                kind: NativeLinkKind::Static,
-            },
-        ]
-    );
-}
-
-#[test]
-fn windows_msvc_leaves_runtime_linking_to_msvc() {
-    let target = target("windows", "x86_64", "msvc", "x86_64-pc-windows-msvc");
-
-    assert!(cpp_runtime_libraries(&target, true).is_empty());
-}
-
-#[test]
-fn existing_platform_cpp_runtime_choices_are_preserved() {
-    let linux = target("linux", "x86_64", "gnu", "x86_64-unknown-linux-gnu");
-    let macos = target("macos", "aarch64", "", "aarch64-apple-darwin");
-    let android = target("android", "aarch64", "", "aarch64-linux-android");
-
-    assert_eq!(cpp_runtime_libraries(&linux, true)[0].name, "stdc++");
-    assert_eq!(cpp_runtime_libraries(&macos, true)[0].name, "c++");
-    assert_eq!(cpp_runtime_libraries(&android, true)[0].name, "c++_static");
+fn historical_features_forward_to_mnn_runtime() {
+    let manifest = include_str!("../Cargo.toml");
+    for mapping in [
+        r#"metal = ["mnn-runtime/metal"]"#,
+        r#"opencl = ["mnn-runtime/opencl"]"#,
+        r#"opengl = ["mnn-runtime/opengl"]"#,
+        r#"vulkan = ["mnn-runtime/vulkan"]"#,
+        r#"cuda = ["mnn-runtime/cuda"]"#,
+        r#"coreml = ["mnn-runtime/coreml"]"#,
+        r#"build-mnn-from-source = ["mnn-runtime/build-from-source"]"#,
+        r#"mnn-dynamic = ["mnn-runtime/dynamic"]"#,
+        r#"mnn-static = ["mnn-runtime/static"]"#,
+        r#"static-cpp-runtime = ["mnn-runtime/static-cpp-runtime"]"#,
+    ] {
+        assert!(
+            manifest.contains(mapping),
+            "missing feature mapping: {mapping}"
+        );
+    }
+    assert!(manifest.contains("default = []"));
+    assert!(manifest.contains("docsrs = []"));
 }

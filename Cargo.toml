@@ -30,23 +30,23 @@ exclude = [
 [features]
 default = []
 # GPU 后端支持
-metal = []  # macOS/iOS Metal GPU 加速
-opencl = [] # OpenCL GPU 加速 (跨平台)
-opengl = [] # OpenGL GPU 加速 (Android/Linux)
-vulkan = [] # Vulkan GPU 加速 (跨平台)
-cuda = []   # NVIDIA CUDA GPU 加速 (Linux/Windows)
-coreml = [] # CoreML 加速 (macOS/iOS)
+metal = ["mnn-runtime/metal"]  # macOS/iOS Metal GPU 加速
+opencl = ["mnn-runtime/opencl"] # OpenCL GPU 加速 (跨平台)
+opengl = ["mnn-runtime/opengl"] # OpenGL GPU 加速 (Android/Linux)
+vulkan = ["mnn-runtime/vulkan"] # Vulkan GPU 加速 (跨平台)
+cuda = ["mnn-runtime/cuda"]   # NVIDIA CUDA GPU 加速 (Linux/Windows)
+coreml = ["mnn-runtime/coreml"] # CoreML 加速 (macOS/iOS)
 
 # MNN 链接方式 (默认使用预编译库，不支持的平台自动回退到源码编译)
 # 强制从源码编译 MNN
-build-mnn-from-source = []
+build-mnn-from-source = ["mnn-runtime/build-from-source"]
 # 使用预编译的 MNN 动态库，需设置 MNN_LIB_DIR 和 MNN_INCLUDE_DIR 环境变量
-mnn-dynamic = []
+mnn-dynamic = ["mnn-runtime/dynamic"]
 # 使用预编译的 MNN 静态库，需设置 MNN_LIB_DIR 和 MNN_INCLUDE_DIR 环境变量
-mnn-static = []
+mnn-static = ["mnn-runtime/static"]
 
 # 在 Windows GNU 上静态链接 MinGW C++/GCC/pthread 运行时，避免分发 MinGW DLL
-static-cpp-runtime = []
+static-cpp-runtime = ["mnn-runtime/static-cpp-runtime"]
 
 # 可选特性
 async = ["tokio", "futures"]
@@ -59,17 +59,11 @@ features = ["docsrs"]
 default-features = false
 targets = ["x86_64-unknown-linux-gnu"]
 
-[build-dependencies]
-cmake = "0.1"
-cc = "1.0"
-bindgen = "0.69"
-
 [dependencies]
 image = "0.25"
 imageproc = "0.25"
 ndarray = { version = "0.16", features = ["rayon"] }
 thiserror = "2"
-sha2 = "0.10"
 log = "0.4"
 rayon = "1.8"
 env_logger = "0.10"
@@ -78,6 +72,14 @@ fast_image_resize = { version = "5", features = ["image"] }
 # 异步支持 (可选)
 tokio = { version = "1", features = ["sync", "rt"], optional = true }
 futures = { version = "0.3", optional = true }
+
+# iOS prebuilts deliberately omit MNN's global thread pool. Other supported
+# targets retain the historical threaded default.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+mnn-runtime = { version = "0.1.0", default-features = false, features = ["prebuilt", "mnn-threadpool"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+mnn-runtime = { version = "0.1.0", default-features = false, features = ["prebuilt"] }
 
 [dev-dependencies]
 criterion = "0.5"

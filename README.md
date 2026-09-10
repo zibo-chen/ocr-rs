@@ -139,7 +139,9 @@ OCR_RS_PERF_TESTS=1 cargo test --release --test performance_tests -- --nocapture
 
 GitHub Actions runs these release tests serially and stores the `PERF_METRIC` log as an artifact. The regression guard compares the direct exact-width pipeline with the legacy crop pipeline on the same runner and fails when the median ratio exceeds `OCR_RS_PERF_REGRESSION_LIMIT` (default `1.15`), avoiding unstable absolute latency limits.
 
-CPU prebuilts and Apple Metal prebuilts are used automatically when compatible. Enabling a GPU feature that is not present in the prebuilt package automatically builds MNN from source:
+Native MNN ownership is provided by [`mnn-runtime`](https://crates.io/crates/mnn-runtime), while `ocr-rs` keeps its existing public inference API through a compatibility layer. This lets multiple model crates in one application share a single `mnn-runtime-sys` / MNN link owner.
+
+Compatible CPU and GPU prebuilts are selected automatically. Unsupported target/feature combinations fall back to building MNN from source:
 
 ```bash
 cargo build --features build-mnn-from-source
