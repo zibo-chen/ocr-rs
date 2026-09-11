@@ -118,7 +118,9 @@ OCR_RS_PERF_TESTS=1 cargo test --release --test performance_tests -- --nocapture
 
 GitHub Actions 会串行运行 release 模式测试，并将 `PERF_METRIC` 日志保存为 artifact。回归门禁会在同一 runner 上比较直通 exact-width 流水线与旧 crop 流水线；中位数比值超过 `OCR_RS_PERF_REGRESSION_LIMIT`（默认 `1.15`）时失败，因此不依赖不稳定的绝对耗时。
 
-兼容时会自动使用 CPU 预构建包或 Apple Metal 预构建包。启用预构建包未包含的 GPU feature 时，会自动从源码构建 MNN：
+原生 MNN 的构建与链接现在由 [`mnn-runtime`](https://crates.io/crates/mnn-runtime) 统一管理；`ocr-rs` 通过兼容层保留原有公开推理 API，并确保同一应用中的多个模型库只链接一份 MNN。
+
+兼容的 CPU/GPU 预构建包会被自动选择；目标平台或 feature 组合没有对应预构建包时，会自动从源码构建 MNN：
 
 ```bash
 cargo build --features build-mnn-from-source

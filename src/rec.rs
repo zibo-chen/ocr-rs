@@ -622,6 +622,11 @@ impl RecModel {
             let mut max_idx = 0usize;
             let mut max_prob = f32::NEG_INFINITY;
             for (idx, &prob) in probs.iter().enumerate() {
+                if !prob.is_finite() {
+                    return Err(OcrError::PostprocessError(format!(
+                        "Non-finite recognition score at timestep {t}, class {idx}; check GPU precision (try High) and compare with CPU"
+                    )));
+                }
                 if prob > max_prob {
                     max_idx = idx;
                     max_prob = prob;
@@ -1012,6 +1017,26 @@ impl RecModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(feature = "docsrs"))]
+    fn non_finite_gpu_scores_are_reported_instead_of_decoded() {
+        let model = RecModel::from_bytes_with_charset(
+            include_bytes!("mnn/fixtures/layout_identity.mnn"),
+            b"A\nB\n",
+            None,
+        )
+        .unwrap();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let output = ndarray::Array::from_shape_vec((1, 1, 4), vec![0.0, value, 0.1, 0.0])
+                .unwrap()
+                .into_dyn();
+            let error = model
+                .decode_output_view_with_alignment(output.view(), 1.0)
+                .unwrap_err();
+            assert!(error.to_string().contains("Non-finite recognition score"));
+        }
+    }
 
     #[test]
     fn test_rec_options_default() {

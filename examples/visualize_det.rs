@@ -24,8 +24,7 @@ fn main() {
     let config = OcrEngineConfig::new().with_det_options(DetOptions::fast());
 
     let engine =
-        OcrEngine::new(det_model, rec_model, keys_path, Some(config))
-            .expect("创建引擎失败");
+        OcrEngine::new(det_model, rec_model, keys_path, Some(config)).expect("创建引擎失败");
 
     println!("加载图像: {}", image_path);
     let image = image::open(image_path).expect("加载图像失败");

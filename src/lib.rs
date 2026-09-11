@@ -129,7 +129,9 @@ pub use engine::{
     OcrEngineConfig, OcrResult_, RecOnlyEngine, RecognizeOptions, RotatedTextMode,
 };
 pub use error::{OcrError, OcrResult};
-pub use mnn::{Backend, GpuMemoryMode, InferenceConfig, InferenceEngine, PrecisionMode};
+pub use mnn::{
+    Backend, GpuMemoryMode, GpuTuningMode, InferenceConfig, InferenceEngine, PrecisionMode,
+};
 pub use ori::{OriModel, OriOptions, OriPreprocessMode, OrientationResult};
 pub use postprocess::TextBox;
 pub use rec::{AlignedRecognitionResult, CharacterSpan, RecModel, RecOptions, RecognitionResult};
